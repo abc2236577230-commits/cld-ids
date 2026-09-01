@@ -1,0 +1,5 @@
+river==0.26.*
+scikit-learn
+pandas
+scipy
+matplotlib

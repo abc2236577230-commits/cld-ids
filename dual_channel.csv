@@ -1,0 +1,5 @@
+trigger_sample,nearest_onset,online_top3,mean_ks_percentile
+50016,50000,stcpb;sjit;sload,0.5526315789473685
+56096,50000,sload;sintpkt,0.7236842105263158
+100032,100000,sload,0.9210526315789473
+140032,140000,stcpb;dtcpb;dload,0.42105263157894735
