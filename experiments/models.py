@@ -22,6 +22,48 @@ def make_ht(grace=50, delta=1e-5):
                                         leaf_prediction="mc")
 
 
+def make_hat(grace=50, delta=1e-5, seed=42):
+    """Hoeffding Adaptive Tree: tree learner with built-in drift handling
+    (implicit adaptation, no external detector needed)."""
+    return tree.HoeffdingAdaptiveTreeClassifier(grace_period=grace, delta=delta,
+                                                leaf_prediction="mc",
+                                                seed=seed)
+
+
+def make_sgd(lr=1e-2, seed=42):
+    """Linear gradient learner (second family for the plasticity spectrum)."""
+    from sklearn.linear_model import SGDClassifier
+    return SGDClassifier(loss="log_loss", penalty="l2", alpha=1e-4,
+                         learning_rate="constant", eta0=lr,
+                         random_state=seed, warm_start=False)
+
+
+def make_logreg(lr=0.05):
+    """Online logistic regression (river): convex gradient learner."""
+    from river import linear_model, optim
+    return linear_model.LogisticRegression(optimizer=optim.SGD(lr))
+
+
+def make_gnb():
+    """Gaussian Naive Bayes: stable sufficient-statistics learner (third
+    family, no gradient descent, no tree splits)."""
+    from river import naive_bayes
+    return naive_bayes.GaussianNB()
+
+
+def make_mlp_ft(lr=1e-2, epochs=3, batch=64, seed=0, hidden=(32, 16)):
+    return MLPClassifier(hidden_layer_sizes=hidden, activation="relu",
+                         learning_rate_init=lr, learning_rate="constant",
+                         max_iter=epochs, random_state=seed, batch_size=batch)
+
+
+def make_sgd_ft(lr=1e-1, epochs=3, seed=0):
+    from sklearn.linear_model import SGDClassifier
+    return SGDClassifier(loss="log_loss", penalty="l2", alpha=1e-4,
+                         learning_rate="constant", eta0=lr,
+                         max_iter=epochs, random_state=seed)
+
+
 def make_periodic(period=5000, window=2000, lr=1e-3, seed=42):
     """Periodic retraining baseline: every `period` samples, refit an MLP on
     the most recent `window` samples."""
@@ -88,8 +130,9 @@ class DriftAware:
     """ADWIN error channel + reset + warm-start replay (+ cooldown, + warm-up)."""
 
     def __init__(self, make_base, delta=0.002, cooldown=5000, warmup=512, batch=64,
-                 start_after=0, finetune_epochs=0, finetune_lr=1e-2):
+                 start_after=0, finetune_epochs=0, finetune_lr=1e-2, make_ft=None):
         self.make_base = make_base
+        self.make_ft = make_ft
         self.delta = delta
         self.cooldown = cooldown
         self.warmup = warmup
@@ -122,13 +165,16 @@ class DriftAware:
             Xb = np.array([np.asarray(v[0]).reshape(-1) for v in seg], dtype=np.float32)
             self.model.partial_fit(Xb, np.array([v[1] for v in seg]), classes=[0, 1])
         if self.finetune_epochs > 0 and len(self.warm) >= 2 * self.batch:
-            from sklearn.neural_network import MLPClassifier
             Xb = np.array([np.asarray(v[0]).reshape(-1) for v in self.warm], dtype=np.float32)
             yb = np.array([v[1] for v in self.warm])
-            m2 = MLPClassifier(hidden_layer_sizes=self.model.hidden_layer_sizes,
-                               activation="relu", learning_rate_init=self.finetune_lr,
-                               learning_rate="constant", max_iter=self.finetune_epochs,
-                               random_state=0, batch_size=self.batch)
+            if self.make_ft is not None:
+                m2 = self.make_ft()
+            else:
+                from sklearn.neural_network import MLPClassifier
+                m2 = MLPClassifier(hidden_layer_sizes=self.model.hidden_layer_sizes,
+                                   activation="relu", learning_rate_init=self.finetune_lr,
+                                   learning_rate="constant", max_iter=self.finetune_epochs,
+                                   random_state=0, batch_size=self.batch)
             m2.partial_fit(Xb, yb, classes=[0, 1])
             self.model = m2
         self.fitted = True
