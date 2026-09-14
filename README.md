@@ -4,7 +4,7 @@ Code and results for the manuscript:
 
 > **An Online Incremental Intrusion Detection Framework under Concept Drift:
 > Design, Mechanisms, and Time-Aware Evaluation**
-> (manuscript under review — venue withheld until acceptance)
+> (target journal: Concurrency and Computation: Practice and Experience, Wiley)
 
 CLD-IDS is a closed-loop, instance-level framework that couples ADWIN
 error-channel detection (gated by warm-up/cooldown) with a family of
