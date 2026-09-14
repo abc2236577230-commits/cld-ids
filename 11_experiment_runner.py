@@ -1,4 +1,4 @@
-"""Unified experiment matrix runner with resume support.
+﻿"""Unified experiment matrix runner with resume support.
 
 Usage:
   python 11_experiment_runner.py --dataset unsw_sub --scenario S4_inversion --seeds 0 1
@@ -13,6 +13,7 @@ import csv
 import os
 import sys
 import time
+from collections import deque
 
 import numpy as np
 from river import preprocessing
@@ -20,7 +21,8 @@ from river import preprocessing
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from experiments import common
 from experiments.models import (DriftAware, PeriodicMLP, make_arf, make_drc_ht,
-                                make_ht, make_mlp, make_periodic)
+                                make_hat, make_ht, make_mlp, make_mlp_ft,
+                                make_gnb, make_logreg, make_periodic, make_sgd, make_sgd_ft)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS = os.path.join(HERE, "..", "results")
@@ -95,39 +97,58 @@ def run_one(dataset, scenario_name, seed, model_name, args):
     cfg = dict(lr=args.lr, window=args.window, rec_thr=args.rec_thr, warmup=args.warmup,
                cooldown=args.cooldown, delta=args.delta, use_cat=int(args.use_cat))
 
+    sk_drift = {"drift", "drift_ft_lo", "drift_ft_mid", "mlp_deep_drift",
+                "mlp_deep_drift_ft", "sgd_drift", "sgd_drift_ft"}
+    river_drift = {"ht_drift", "hat_drift", "gnb_drift", "logreg_drift"}
+    river_plain = {"ht_plain", "hat_plain", "gnb", "logreg"}
+
+    model, fitted, drift_aw, periodic = None, False, None, None
     if model_name == "plain":
         model = make_mlp(lr=args.lr, seed=seed)
-        fitted, drift_aw, periodic = False, None, None
-    elif model_name == "drift":
-        drift_aw = DriftAware(lambda: make_mlp(lr=args.lr, seed=seed),
+    elif model_name == "mlp_deep":
+        model = make_mlp(lr=args.lr, hidden=(64, 32, 16), seed=seed)
+    elif model_name == "sgd":
+        model = make_sgd(lr=args.lr, seed=seed)
+    elif model_name == "periodic":
+        periodic = PeriodicMLP(period=args.period, window=args.window, lr=1e-3, seed=seed,
+                               n_features=len(feats) + len(cat_cols))
+    elif model_name == "arf":
+        model = make_arf(seed=seed)
+    elif model_name in river_plain:
+        model = (make_gnb() if model_name == "gnb" else (make_logreg() if model_name == "logreg" else (make_hat() if model_name == "hat_plain" else make_ht())))
+    elif model_name in river_drift:
+        base = (make_gnb if model_name == "gnb_drift" else (make_logreg if model_name == "logreg_drift" else (make_hat if model_name == "hat_drift" else make_ht)))
+        drift_aw = DriftAware(lambda: base(), delta=args.delta,
+                              cooldown=args.cooldown, warmup=args.warmup, batch=BATCH,
+                              start_after=args.start_after)
+        drift_aw.fitted = True  # tree learners predict without training; warm-start n/a
+    elif model_name in sk_drift:
+        if model_name in ("drift", "drift_ft_lo", "drift_ft_mid"):
+            base = lambda: make_mlp(lr=args.lr, seed=seed)
+            _ftlr = {"drift_ft_lo": 5e-4, "drift_ft_mid": 1e-3}.get(model_name, args.finetune_lr)
+            ft = (lambda: make_mlp_ft(lr=_ftlr, epochs=args.finetune_epochs, batch=BATCH))
+        elif model_name in ("mlp_deep_drift", "mlp_deep_drift_ft"):
+            base = lambda: make_mlp(lr=args.lr, hidden=(64, 32, 16), seed=seed)
+            ft = (lambda: make_mlp_ft(lr=args.finetune_lr, epochs=args.finetune_epochs,
+                                      batch=BATCH, hidden=(64, 32, 16)))
+        else:
+            base = lambda: make_sgd(lr=args.lr, seed=seed)
+            ft = (lambda: make_sgd_ft(lr=args.finetune_lr, epochs=args.finetune_epochs))
+        drift_aw = DriftAware(base,
                               delta=args.delta, cooldown=args.cooldown,
                               warmup=args.warmup, batch=BATCH,
                               start_after=args.start_after,
                               finetune_epochs=args.finetune_epochs,
-                              finetune_lr=args.finetune_lr)
-        model, fitted = None, False
-    elif model_name == "periodic":
-        periodic = PeriodicMLP(period=args.period, window=args.window, lr=1e-3, seed=seed,
-                               n_features=len(feats) + len(cat_cols))
-        model, fitted = None, False
-    elif model_name == "ht_plain":
-        model, fitted = make_ht(), False
-        drift_aw, periodic = None, None
-    elif model_name == "arf":
-        model, fitted = make_arf(seed=seed), False
-        drift_aw, periodic = None, None
-    elif model_name == "ht_drift":
-        drift_aw = DriftAware(lambda: make_ht(), delta=args.delta,
-                              cooldown=args.cooldown, warmup=args.warmup, batch=BATCH,
-                              start_after=args.start_after)
-        model, fitted = None, False
-        drift_aw.fitted = True  # HT can predict without training; warm-start n/a
+                              finetune_lr=args.finetune_lr,
+                              make_ft=(ft if args.finetune_epochs > 0 else None))
     else:
         raise ValueError(model_name)
 
     # --- stream ---
     recent = []
     triggers = []
+    label_delay = int(getattr(args, "label_delay", 0) or 0)
+    pend = deque()
     sm = common.StreamMetrics(onsets, n, window=args.window, rec_thr=args.rec_thr)
     seg_idx = 0
     for i in range(n):
@@ -142,65 +163,66 @@ def run_one(dataset, scenario_name, seed, model_name, args):
                       dtype=np.float32).reshape(1, -1)
         scaler.learn_one(xd)
 
-        if model_name == "plain":
+        if model_name in ("plain", "sgd", "mlp_deep"):
             yp = model.predict(xn)[0] if fitted else 0
-        elif model_name == "drift":
+        elif model_name in sk_drift:
             yp = drift_aw.predict(xn)
         elif model_name == "periodic":
             yp = periodic.predict(xn)
-        elif model_name == "ht_plain":
+        elif model_name in river_plain:
             yp = model.predict_one(xd) or 0
         elif model_name == "arf":
             yp = (model.predict_one(xd) or 0) if fitted else 0
-        elif model_name == "ht_drift":
+        elif model_name in river_drift:
             yp = drift_aw.predict(xd)
         yp = int(yp)
 
-        err = 1 if y_true != yp else 0
+        # predictions/metrics always use the true label at time t
         sm.update(i, y_true, yp, seg_idx)
-        if model_name == "drift":
-            drift_aw.update_detector(err)
-            if drift_aw.maybe_reset(i):
-                triggers.append(i + 1)
-        elif model_name == "ht_drift":
-            drift_aw.update_detector(err)
+
+        # label-delay gate: model updates (and error-channel detection) only
+        # happen once the label is observed, N samples later.
+        if label_delay > 0:
+            pend.append((xn, xd, y_true, yp))
+            if len(pend) <= label_delay:
+                continue
+            lxn, lxd, ly, lyp = pend.popleft()
+        else:
+            lxn, lxd, ly, lyp = xn, xd, y_true, yp
+
+        if model_name in sk_drift or model_name in river_drift:
+            drift_aw.update_detector(1 if ly != lyp else 0)
             if drift_aw.maybe_reset(i):
                 triggers.append(i + 1)
 
         # learn
-        if model_name == "plain":
-            recent.append((xn[0], y_true))
+        if model_name in ("plain", "sgd", "mlp_deep"):
+            recent.append((lxn[0], ly))
             if len(recent) >= BATCH:
                 Xb = np.array([v[0] for v in recent], dtype=np.float32)
                 yb = np.array([v[1] for v in recent])
-                if fitted:
-                    model.partial_fit(Xb, yb, classes=[0, 1])
-                else:
-                    model.partial_fit(Xb, yb, classes=[0, 1])
-                    fitted = True
+                model.partial_fit(Xb, yb, classes=[0, 1])
+                fitted = True
                 recent = []
-        elif model_name == "drift":
-            drift_aw.push_warm(xn, y_true)
-            recent.append((xn[0], y_true))
+        elif model_name in sk_drift:
+            drift_aw.push_warm(lxn, ly)
+            recent.append((lxn[0], ly))
             if len(recent) >= BATCH:
                 Xb = np.array([v[0] for v in recent], dtype=np.float32)
                 yb = np.array([v[1] for v in recent])
-                if drift_aw.fitted:
-                    drift_aw.model.partial_fit(Xb, yb, classes=[0, 1])
-                else:
-                    drift_aw.model.partial_fit(Xb, yb, classes=[0, 1])
-                    drift_aw.fitted = True
+                drift_aw.model.partial_fit(Xb, yb, classes=[0, 1])
+                drift_aw.fitted = True
                 recent = []
         elif model_name == "periodic":
-            periodic.update(xn, y_true)
-        elif model_name == "ht_plain":
-            model.learn_one(xd, y_true)
+            periodic.update(lxn, ly)
+        elif model_name in river_plain:
+            model.learn_one(lxd, ly)
         elif model_name == "arf":
-            model.learn_one(xd, y_true)
+            model.learn_one(lxd, ly)
             fitted = True
-        elif model_name == "ht_drift":
-            drift_aw.model.learn_one(xd, y_true)
-            drift_aw.push_warm(xd, y_true)
+        elif model_name in river_drift:
+            drift_aw.model.learn_one(lxd, ly)
+            drift_aw.push_warm(lxd, ly)
 
     res = sm.results()
     row = {
@@ -229,8 +251,11 @@ def main():
     ap.add_argument("--dataset", required=True, choices=["unsw_full", "unsw_sub", "nslkdd"])
     ap.add_argument("--scenario", default="all")
     ap.add_argument("--models", nargs="+", default=["plain", "drift"],
-                    choices=["plain", "drift", "periodic", "ht_plain", "ht_drift",
-                             "arf"])
+                    choices=["plain", "mlp_deep", "drift", "drift_ft_lo", "drift_ft_mid",
+                             "mlp_deep_drift", "mlp_deep_drift_ft", "periodic",
+                             "ht_plain", "ht_drift", "hat_plain", "hat_drift",
+                             "gnb", "gnb_drift", "logreg", "logreg_drift",
+                             "sgd", "sgd_drift", "sgd_drift_ft", "arf"])
     ap.add_argument("--seeds", nargs="+", type=int, default=[0])
     ap.add_argument("--use-cat", action="store_true")
     ap.add_argument("--lr", type=float, default=5e-4)
@@ -245,6 +270,8 @@ def main():
     ap.add_argument("--out", default=os.path.join(RESULTS, "experiment_matrix.csv"))
     ap.add_argument("--finetune-epochs", type=int, default=0)
     ap.add_argument("--finetune-lr", type=float, default=1e-2)
+    ap.add_argument("--label-delay", type=int, default=0,
+                    help="defer model updates by N samples (0 = immediate)")
     args = ap.parse_args()
 
     scenarios = (["S1_abrupt", "S2_gradual", "S3_recurrent", "S4_inversion"]
@@ -266,3 +293,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
