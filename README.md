@@ -4,7 +4,7 @@ Code and results for the manuscript:
 
 > **An Online Incremental Intrusion Detection Framework under Concept Drift:
 > Design, Mechanisms, and Time-Aware Evaluation**
-> (Sensors, under review — details withheld until acceptance)
+> (manuscript under review — venue withheld until acceptance)
 
 CLD-IDS is a closed-loop, instance-level framework that couples ADWIN
 error-channel detection (gated by warm-up/cooldown) with a family of
@@ -13,6 +13,13 @@ fine-tuning) and a parallel KSWIN-like feature-channel attribution.
 Evaluation follows a time-aware prequential protocol: recovery time,
 post-onset error AUC, and rolling F1/G-mean over 10 seeds with paired
 Wilcoxon tests.
+
+The central empirical finding is **learner-conditioned**: reset harm tracks
+loss-surface **non-convexity**. Resetting a non-convex gradient learner
+without high-learning-rate fine-tuning prolongs recovery, whereas convex
+online linear learners and Hoeffding-tree learners do not benefit from
+explicit detection. A de-confounded 2x2 factorial attributes the effect to
+the fine-tuning, not the warm-start buffer.
 
 ## Environment
 
@@ -32,7 +39,7 @@ Note: the official UNSW-NB15 `attack_cat` is labelled for only 12.6% of
 rows (official limitation); this work uses the full 2.54M pool with 100%
 per-family retention where `attack_cat` is present (see `results/DATA_AUDIT.md`).
 
-## Reproduce the full matrix (700 runs)
+## Reproduce the core matrix (700 runs)
 
 ```bash
 # UNSW full (4 main scenarios x 10 seeds x 6 configs)
@@ -46,21 +53,50 @@ python check_matrix.py
 python audit_data.py
 ```
 
+## Reproduce the extended matrix (de-bundling + spectrum + label delay)
+
+```bash
+# de-bundled 2x2, learner-plasticity spectrum (HAT, SGD, logreg, GNB), lr curve
+python 25_extended_runner.py --dataset all --wave all
+# second non-convex learner (mlp_deep) + label-delay hardening
+python 25_extended_runner.py --dataset all --wave nonconv
+python 25_extended_runner.py --dataset all --wave delay
+# analysis + figures
+python 26_spectrum.py      # RHI spectrum, 2x2, lr curve, delay -> results/spectrum_summary.md
+python 27_fig_spectrum.py  # fig6 factorial, fig7 spectrum, fig8 lr curve, fig9 label delay
+python 28_breakdown.py     # per-dataset robustness
+```
+
+Total: 700 core + 1680 extended = **2380 runs** over two datasets, five
+controlled scenarios, up to 20 model configurations, and 10 seeds.
+
 ## Key configuration (see paper Methods)
 
 - Online MLP: 32-16 hidden, lr=5e-4 (constant), batch=64, max_iter=1/epoch, online StandardScaler
+- Deeper non-convex MLP: 64-32-16 hidden
+- Convex online linear: SGD logistic (lr=1e-2) and river `LogisticRegression`
 - drift-aware: ADWIN(delta=0.002), warm-up 5000, cooldown 5000, warm-start replay 2000, high-lr (1e-2) fine-tune 3 epochs
-- HT: grace=50, delta=1e-5, mc leaf prediction
-- ARF: river default 10 trees, mc leaves (strongest baseline: F1 0.9996 main / 0.9871 rare, but slowest: 372 us/sample)
+- HT/HAT: grace=50, delta=1e-5, mc leaf prediction
+- ARF: river default 10 trees, mc leaves (strong F1: 0.9996 main / 0.9871 rare, but slowest: 372 us/sample)
+- Label delay: updates deferred by 500 samples
 - Evaluation: prequential, rolling window 2000, recovery threshold 0.15, error-AUC horizon 10000, 10 seeds, Wilcoxon Pratt exact
 
 ## Results (aggregates)
 
-- `results/stats_summary.md` — main tables + Wilcoxon significance
+- `results/stats_summary.md` — main tables + Wilcoxon significance (core matrix)
+- `results/spectrum_summary.md` — de-bundled 2x2, Reset-Harm Index, lr curve, label delay
 - `results/overhead_bench.md` — latency/throughput/memory benchmark
 - `results/sensitivity_grid.csv` — 6-hyperparameter sensitivity grid
 - `results/dual_channel.csv` — error/feature channel alignment
-- `results/figures/` — paper figures 1-5 (300 dpi)
+- `results/figures/` — figures 1–9 (300 dpi, PNG + PDF)
+  - fig6 de-bundled factorial, fig7 reset-harm spectrum (by learner), fig8 fine-tune lr curve, fig9 label-delay hardening
+
+## Headline numbers
+
+- Fine-tuning main effect on MLP: ΔAUC -0.104 (p<1e-4); buffer main effect -0.011 (p=0.12, ns); reset-only +0.051 (p<1e-4)
+- Reset-Harm Index: MLP-32/16 +0.051, MLP-64/32/16 +0.033 (non-convex); SGD -0.008, logistic -0.054 (convex); HT -0.001, HAT +0.011 (tree)
+- Fine-tune lr curve (F1): 5e-4 .656, 1e-3 .709, 1e-2 .835
+- Best single configuration: convex logistic reset+replay F1 0.9986 (above ARF 0.9961)
 
 ## AI-assisted research disclosure
 
